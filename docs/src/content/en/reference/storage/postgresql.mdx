@@ -632,3 +632,69 @@ PostgreSQL offers different index types optimized for specific scenarios:
 | **gist** | Geometric data, full-text search | Moderate | Fast for nearest-neighbor |
 | **spgist** | Non-balanced data, text patterns | Small | Fast for specific patterns |
 | **brin** | Large tables with natural ordering | Very small | Fast for ranges |
+
+### vNext observability storage
+
+Mastra ships an alternative observability adapter at `stores/pg/src/storage/domains/observability/v-next` that mirrors the ClickHouse v-next layout: one partitioned table per signal (`mastra_span_events`, `mastra_trace_roots`, `mastra_metric_events`, `mastra_log_events`, `mastra_score_events`, `mastra_feedback_events`) and an insert-only write strategy with `ON CONFLICT DO NOTHING` for retry idempotency.
+
+Use `PostgresStoreVNext` to opt in:
+
+```typescript title="src/mastra/index.ts"
+import { Mastra } from '@mastra/core'
+import { PostgresStoreVNext } from '@mastra/pg'
+
+export const mastra = new Mastra({
+  storage: new PostgresStoreVNext({
+    id: 'pg-observability',
+    connectionString: process.env.OBSERVABILITY_PG_URL!,
+  }),
+})
+```
+
+The adapter detects extensions at `init()`:
+
+- TimescaleDB present: each signal table is converted to a hypertable with daily chunks via `create_hypertable()`. Native columnstore compression and retention policies remain operator-controlled.
+- pg\_partman present: signal tables are registered as native daily-partitioned parents and partman manages future partition creation.
+- Neither: the adapter pre-creates a rolling window of daily native partitions. Future partitions can be extended by a separate Mastra CLI command (not yet shipped).
+
+#### When to use it
+
+The vNext Postgres observability adapter is intended for **low-volume production** workloads. Use the [ClickHouse adapter](/reference/storage/clickhouse) for high-volume agent workloads. Postgres on a single primary cannot keep up past roughly 1,500 calls per second sustained, even with TimescaleDB. See `observability/postgres-design/recommendation.md` in the repository for the volume math behind this guidance.
+
+#### Use a dedicated database
+
+Point this adapter at a Postgres instance that is **not** your primary application database. Observability writes have very different read/write patterns than a typical application schema (heavy JSONB writes, daily partition churn, and discovery scans on signal tables) and will degrade your application performance if they share resources.
+
+Compose the observability adapter alongside a different primary store using `MastraCompositeStore`:
+
+```typescript title="src/mastra/storage.ts"
+import { MastraCompositeStore } from '@mastra/core/storage'
+import { PostgresStore } from '@mastra/pg'
+import { ObservabilityStoragePostgresVNext } from '@mastra/pg'
+
+const primary = new PostgresStore({
+  id: 'primary',
+  connectionString: process.env.DATABASE_URL!,
+})
+
+const observability = new ObservabilityStoragePostgresVNext({
+  connectionString: process.env.OBSERVABILITY_PG_URL!,
+})
+
+export const storage = new MastraCompositeStore({
+  id: 'composite',
+  stores: { ...primary.stores, observability },
+})
+```
+
+#### Configuration
+
+The vNext adapter accepts the standard `PostgresStore` connection options plus:
+
+- `partitioning.mode`: `"auto"` (default), `"timescale"`, `"partman"`, or `"native"`. `"auto"` detects the available extension at `init()`. Force a specific mode for tests or staged rollouts.
+- `partitioning.futureDays`: How many future daily partitions to pre-create in `"native"` mode. Default `14`.
+- `discovery.ttlSeconds`: How long discovery values (entity types, service names, tags, metric label keys, and so on) are served from the cache table before a refresh is triggered in the background. Default `300` (5 minutes).
+
+The adapter declares the `insert-only` observability strategy. Use `maxBatchSize: 1` on the default exporter to emulate realtime semantics during local development.
+
+Retention cleanup is intentionally not implemented in this release. The partitioning skeleton is designed so a future `mastra retention` CLI command can drop or compress old partitions without further migrations.
